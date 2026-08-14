@@ -81,25 +81,25 @@ on:
     outputs:
       artifact-name:
         description: Artifact name published by this workflow
-        value: ${{ jobs.build-test-scan-package.outputs.artifact-name }}
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_name }}
       artifact-version:
         description: Immutable artifact version published by this workflow
-        value: ${{ jobs.build-test-scan-package.outputs.artifact-version }}
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_version }}
       artifact-uri:
         description: Artifactory URI returned by the enterprise upload wrapper
-        value: ${{ jobs.build-test-scan-package.outputs.artifact-uri }}
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_uri }}
 
 jobs:
-  build-test-scan-package:
+  build_test_scan_package:
     name: Build, test, scan, package, publish
     runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
       id-token: write
     outputs:
-      artifact-name: ${{ steps.metadata.outputs.artifact-name }}
-      artifact-version: ${{ steps.metadata.outputs.artifact-version }}
-      artifact-uri: ${{ steps.artifactory.outputs.artifact-uri }}
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      artifact_version: ${{ steps.metadata.outputs.artifact_version }}
+      artifact_uri: ${{ steps.artifactory.outputs.artifact_uri }}
 
     steps:
       - name: Checkout source
@@ -183,8 +183,8 @@ jobs:
         run: |
           $shortSha = "${{ github.sha }}".Substring(0, 8)
           $version = "${{ inputs.artifact-version-prefix }}.${{ github.run_number }}-$shortSha"
-          "artifact-name=${{ inputs.artifact-name }}" >> $env:GITHUB_OUTPUT
-          "artifact-version=$version" >> $env:GITHUB_OUTPUT
+          "artifact_name=${{ inputs.artifact-name }}" >> $env:GITHUB_OUTPUT
+          "artifact_version=$version" >> $env:GITHUB_OUTPUT
           "ARTIFACT_VERSION=$version" >> $env:GITHUB_ENV
 
       - name: Publish web application
@@ -212,4 +212,4 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Artifactory publication failed." }
           $uri = ($uri | Select-Object -Last 1).Trim()
           if ([string]::IsNullOrWhiteSpace($uri)) { throw "Artifactory wrapper did not return an artifact URI." }
-          "artifact-uri=$uri" >> $env:GITHUB_OUTPUT
+          "artifact_uri=$uri" >> $env:GITHUB_OUTPUT
