@@ -79,13 +79,13 @@ on:
         type: string
         default: enterprise-artifactory-upload
     outputs:
-      artifact-name:
+      artifact_name:
         description: Artifact name published by this workflow
         value: ${{ jobs.build_test_scan_package.outputs.artifact_name }}
-      artifact-version:
+      artifact_version:
         description: Immutable artifact version published by this workflow
         value: ${{ jobs.build_test_scan_package.outputs.artifact_version }}
-      artifact-uri:
+      artifact_uri:
         description: Artifactory URI returned by the enterprise upload wrapper
         value: ${{ jobs.build_test_scan_package.outputs.artifact_uri }}
 
