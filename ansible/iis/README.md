@@ -50,6 +50,16 @@ Point an AWX Project at this repository and branch. AWX will discover `collectio
 
 For the laptop MigrationLab, configure the job template to target the Windows host over WinRM/PSRP using an AWX machine credential. The sample generated-workflow call pattern is `templates/call-iis-awx-deploy.yaml`.
 
+The checked-in lab inventory example is `ansible/inventory/host.ini`; its host and port tokens must be rendered from secrets outside source control. The API bootstrap workflows pull `AAP_BASE_URL`, `IIS_HOST`, `WINRM_PORT`, and `AAP_TOKEN` through the caller's GitHub secrets, then create the equivalent AAP inventory, `iis_targets` group, host, machine credential association, and controller job template. Inventory configuration does not create network reachability; SaaS AAP still requires a supported routed execution path to the private Windows host.
+
+## AAP bootstrap templates
+
+- `reusable-aap-project-bootstrap.yaml` creates or updates the Git-backed AAP project.
+- `reusable-aap-machine-credential-bootstrap.yaml` stores the Windows account in an AAP Machine credential.
+- `reusable-aap-controller-job-bootstrap.yaml` creates the inventory, group, host, and IIS job template.
+- `reusable-aap-job-launch.yaml` launches a protected-environment deployment and waits for terminal status.
+- `templates/call-aap-iis-lab-bootstrap.yaml` and `templates/call-aap-job-launch.yaml` are the lab caller examples.
+
 ## Migration LLM mapping rule
 
 When the Azure DevOps release contains IIS/Web Deploy/PowerShell deployment logic, normalize it into the inputs of the central reusable workflow:

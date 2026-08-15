@@ -9,10 +9,6 @@ on:
         required: false
         type: string
         default: ubuntu-latest
-      aap-base-url:
-        description: AAP platform gateway base URL, for example https://aap.example.com
-        required: true
-        type: string
       organization-name:
         description: Existing AAP organization that will own the project
         required: false
@@ -62,6 +58,9 @@ on:
         type: number
         default: 300
     secrets:
+      aap-base-url:
+        description: AAP platform gateway base URL
+        required: true
       aap-token:
         description: AAP platform gateway OAuth2/personal access token
         required: true
@@ -96,7 +95,7 @@ jobs:
         id: project
         shell: bash
         env:
-          AAP_BASE_URL: ${{ inputs.aap-base-url }}
+          AAP_BASE_URL: ${{ secrets.aap-base-url }}
           AAP_TOKEN: ${{ secrets.aap-token }}
           ORGANIZATION_NAME: ${{ inputs.organization-name }}
           PROJECT_NAME: ${{ inputs.project-name }}

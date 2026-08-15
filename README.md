@@ -12,6 +12,9 @@ These workflow examples comprise three parts:
 
 ## Examples
 
+- [`ansible/iis/deploy-iis.yml`](ansible/iis/deploy-iis.yml) and the reusable AAP workflows provide the Azure DevOps migration contract for build-once deployment to Windows IIS through AAP/WinRM.
+- [`templates/call-aap-iis-lab-bootstrap.yaml`](templates/call-aap-iis-lab-bootstrap.yaml) creates the MigrationLab AAP project, credential, inventory, host, group, and job template without storing secret values in source.
+
 - [`.github/dependabot.yml`](.github/dependabot.yml) will make PRs for version updates to your Actions *and* Dockerfiles.
 - [`.github/linters/`](.github/linters/) stores linter configs used by Super-Linter. ProTip: symlink these to the preferred location to use the same linters locally.
 - [`templates/call-super-linter.yaml`](templates/call-super-linter.yaml) is a workflow that calls Super-Linter, which I'm storing the full reusable workflow in [bretfisher/super-linter-workflow](https://github.com/BretFisher/super-linter-workflow).

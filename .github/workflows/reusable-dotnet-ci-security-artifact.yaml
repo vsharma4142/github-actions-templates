@@ -56,8 +56,19 @@ on:
         default: 1.0
       artifactory-repository:
         description: Target Artifactory repository/path consumed by the enterprise wrapper
-        required: true
+        required: false
         type: string
+        default: ''
+      security-mode:
+        description: enterprise executes wrappers; lab-dummy emits deterministic zero-finding reports
+        required: false
+        type: string
+        default: enterprise
+      artifact-provider:
+        description: artifactory or github-actions
+        required: false
+        type: string
+        default: artifactory
       checkmarx-command:
         description: Enterprise Checkmarx wrapper executable available on the runner
         required: false
@@ -88,6 +99,9 @@ on:
       artifact_uri:
         description: Artifactory URI returned by the enterprise upload wrapper
         value: ${{ jobs.build_test_scan_package.outputs.artifact_uri }}
+      artifact_sha256:
+        description: SHA-256 digest of the immutable ZIP
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_sha256 }}
 
 jobs:
   build_test_scan_package:
@@ -100,6 +114,7 @@ jobs:
       artifact_name: ${{ steps.metadata.outputs.artifact_name }}
       artifact_version: ${{ steps.metadata.outputs.artifact_version }}
       artifact_uri: ${{ steps.artifactory.outputs.artifact_uri }}
+      artifact_sha256: ${{ steps.package.outputs.artifact_sha256 }}
 
     steps:
       - name: Checkout source
@@ -148,6 +163,7 @@ jobs:
           }
 
       - name: Checkmarx security gate
+        if: inputs.security-mode == 'enterprise'
         shell: pwsh
         env:
           MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
@@ -158,6 +174,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Checkmarx security gate failed." }
 
       - name: Snyk security gate
+        if: inputs.security-mode == 'enterprise'
         shell: pwsh
         env:
           MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
@@ -168,6 +185,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Snyk security gate failed." }
 
       - name: Nexus IQ policy gate
+        if: inputs.security-mode == 'enterprise'
         shell: pwsh
         env:
           MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
@@ -176,6 +194,30 @@ jobs:
           $tool = Get-Command "${{ inputs.nexus-iq-command }}" -ErrorAction Stop
           & $tool.Source --source "." --application "${{ github.event.repository.name }}" --max-high $env:MAX_HIGH --max-critical $env:MAX_CRITICAL
           if ($LASTEXITCODE -ne 0) { throw "Nexus IQ policy gate failed." }
+
+      - name: Validate lab security mode
+        if: inputs.security-mode != 'enterprise' && inputs.security-mode != 'lab-dummy'
+        shell: pwsh
+        run: throw "security-mode must be 'enterprise' or 'lab-dummy'."
+
+      - name: Run deterministic lab security gates
+        if: inputs.security-mode == 'lab-dummy'
+        shell: pwsh
+        env:
+          MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
+          MAX_CRITICAL: ${{ inputs.max-critical-vulnerabilities }}
+        run: |
+          $report = @{
+            mode = 'lab-dummy'
+            checkmarx = @{ high = 0; critical = 0 }
+            snyk = @{ high = 0; critical = 0 }
+            nexusIq = @{ high = 0; critical = 0 }
+          }
+          $report | ConvertTo-Json -Depth 4 | Set-Content "${{ runner.temp }}/lab-security-report.json"
+          if (0 -gt [int]$env:MAX_HIGH -or 0 -gt [int]$env:MAX_CRITICAL) {
+            throw 'Lab security threshold is invalid.'
+          }
+          Write-Host 'LAB ONLY: Checkmarx, Snyk, and Nexus IQ returned zero deterministic findings.'
 
       - name: Create immutable artifact metadata
         id: metadata
@@ -196,14 +238,18 @@ jobs:
           --output "${{ runner.temp }}/publish"
 
       - name: Package immutable artifact
+        id: package
         shell: pwsh
         run: |
           $zip = "${{ runner.temp }}/${{ inputs.artifact-name }}-$env:ARTIFACT_VERSION.zip"
           if (Test-Path $zip) { Remove-Item $zip -Force }
           Compress-Archive -Path "${{ runner.temp }}/publish/*" -DestinationPath $zip
+          $sha256 = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
           "ARTIFACT_FILE=$zip" >> $env:GITHUB_ENV
+          "artifact_sha256=$sha256" >> $env:GITHUB_OUTPUT
 
       - name: Publish artifact to Artifactory
+        if: inputs.artifact-provider == 'artifactory'
         id: artifactory
         shell: pwsh
         run: |
@@ -213,3 +259,17 @@ jobs:
           $uri = ($uri | Select-Object -Last 1).Trim()
           if ([string]::IsNullOrWhiteSpace($uri)) { throw "Artifactory wrapper did not return an artifact URI." }
           "artifact_uri=$uri" >> $env:GITHUB_OUTPUT
+
+      - name: Publish immutable GitHub Actions artifact
+        if: inputs.artifact-provider == 'github-actions'
+        uses: actions/upload-artifact@v4
+        with:
+          name: immutable-iis-package
+          path: ${{ env.ARTIFACT_FILE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Validate artifact provider
+        if: inputs.artifact-provider != 'artifactory' && inputs.artifact-provider != 'github-actions'
+        shell: pwsh
+        run: throw "artifact-provider must be 'artifactory' or 'github-actions'."
