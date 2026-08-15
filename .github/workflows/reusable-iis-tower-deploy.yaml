@@ -1,11 +1,11 @@
 ---
-name: Reusable IIS Deployment via Tower
+name: Reusable IIS Deployment via Tower or AWX
 
 on:
   workflow_call:
     inputs:
       runner:
-        description: Runner label that can reach Vault, Artifactory and Ansible Tower
+        description: Runner label that can reach Vault, Artifactory and Tower/AWX
         required: false
         type: string
         default: ubuntu-latest
@@ -13,6 +13,11 @@ on:
         description: GitHub Environment name used for protection/approval
         required: true
         type: string
+      deployment-mode:
+        description: enterprise-wrapper or awx-api
+        required: false
+        type: string
+        default: enterprise-wrapper
       artifact-name:
         description: Immutable artifact name
         required: true
@@ -22,21 +27,49 @@ on:
         required: true
         type: string
       artifact-uri:
-        description: Artifactory URI produced by CI
+        description: Immutable Artifactory URI produced by CI
         required: true
         type: string
+      artifact-sha256:
+        description: Optional SHA-256 checksum for immutable artifact verification
+        required: false
+        type: string
+        default: ''
       tower-job-template:
-        description: Existing Ansible Tower/AAP job template identifier
-        required: true
+        description: Existing Ansible Tower/AAP job template identifier for enterprise-wrapper mode
+        required: false
         type: string
+        default: ''
       vault-role:
         description: Existing HashiCorp Vault role used by the enterprise wrapper
-        required: true
+        required: false
         type: string
+        default: ''
       vault-secret-path:
         description: Vault path containing deployment credentials/configuration
-        required: true
+        required: false
         type: string
+        default: ''
+      awx-base-url:
+        description: AWX base URL reachable by this runner, for example http://awx.local
+        required: false
+        type: string
+        default: ''
+      awx-job-template-id:
+        description: AWX job template numeric ID configured to run ansible/iis/deploy-iis.yml
+        required: false
+        type: string
+        default: ''
+      awx-verify-tls:
+        description: Verify TLS certificate when calling AWX API
+        required: false
+        type: boolean
+        default: true
+      target-group:
+        description: AWX inventory group containing target IIS hosts
+        required: false
+        type: string
+        default: iis_targets
       site-name:
         description: IIS website name
         required: true
@@ -49,10 +82,31 @@ on:
         description: IIS physical deployment path
         required: true
         type: string
-      host-name:
-        description: IIS host header / endpoint host
-        required: true
+      backup-root:
+        description: IIS deployment backup directory
+        required: false
         type: string
+        default: 'C:\MigrationLab\backups'
+      staging-root:
+        description: IIS artifact staging directory
+        required: false
+        type: string
+        default: 'C:\MigrationLab\staging'
+      host-name:
+        description: IIS host header; may be empty for local lab
+        required: false
+        type: string
+        default: ''
+      http-port:
+        description: HTTP port used by the IIS site
+        required: false
+        type: number
+        default: 8080
+      enable-https:
+        description: Configure HTTPS binding and certificate
+        required: false
+        type: boolean
+        default: false
       https-port:
         description: HTTPS port
         required: false
@@ -60,22 +114,33 @@ on:
         default: 443
       certificate-thumbprint:
         description: Certificate thumbprint or approved certificate reference
-        required: true
-        type: string
-      authentication-mode:
-        description: IIS authentication mode understood by the Tower template
         required: false
         type: string
-        default: Windows
+        default: ''
+      authentication-mode:
+        description: Anonymous, Windows, or Unchanged
+        required: false
+        type: string
+        default: Anonymous
       health-url:
-        description: Endpoint used for post-deployment validation
+        description: Endpoint used for post-deployment validation from the IIS host
         required: true
         type: string
+      health-validate-certs:
+        description: Validate TLS certificate during Ansible health check
+        required: false
+        type: boolean
+        default: true
       config-json:
         description: Non-secret environment-specific configuration JSON
         required: false
         type: string
         default: '{}'
+      runner-health-check:
+        description: Also test health-url from the GitHub runner after AWX completes
+        required: false
+        type: boolean
+        default: false
       tower-command:
         description: Enterprise Tower/AAP wrapper executable available on the runner
         required: false
@@ -86,6 +151,10 @@ on:
         required: false
         type: string
         default: enterprise-vault-read
+    secrets:
+      awx-token:
+        description: AWX OAuth2/personal access token for awx-api mode
+        required: false
 
 jobs:
   deploy:
@@ -97,7 +166,37 @@ jobs:
       id-token: write
 
     steps:
+      - name: Validate deployment mode
+        shell: bash
+        env:
+          DEPLOYMENT_MODE: ${{ inputs.deployment-mode }}
+          TOWER_JOB_TEMPLATE: ${{ inputs.tower-job-template }}
+          VAULT_ROLE: ${{ inputs.vault-role }}
+          VAULT_SECRET_PATH: ${{ inputs.vault-secret-path }}
+          AWX_BASE_URL: ${{ inputs.awx-base-url }}
+          AWX_JOB_TEMPLATE_ID: ${{ inputs.awx-job-template-id }}
+          AWX_TOKEN: ${{ secrets.awx-token }}
+        run: |
+          set -euo pipefail
+          case "$DEPLOYMENT_MODE" in
+            enterprise-wrapper)
+              test -n "$TOWER_JOB_TEMPLATE"
+              test -n "$VAULT_ROLE"
+              test -n "$VAULT_SECRET_PATH"
+              ;;
+            awx-api)
+              test -n "$AWX_BASE_URL"
+              test -n "$AWX_JOB_TEMPLATE_ID"
+              test -n "$AWX_TOKEN"
+              ;;
+            *)
+              echo "Unsupported deployment-mode: $DEPLOYMENT_MODE" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Resolve deployment secret reference from Vault
+        if: inputs.deployment-mode == 'enterprise-wrapper'
         id: vault
         shell: bash
         env:
@@ -110,7 +209,8 @@ jobs:
           test -n "$secret_ref"
           echo "secret-ref=$secret_ref" >> "$GITHUB_OUTPUT"
 
-      - name: Launch Ansible Tower/AAP IIS deployment
+      - name: Launch enterprise Tower/AAP IIS deployment
+        if: inputs.deployment-mode == 'enterprise-wrapper'
         id: tower
         shell: bash
         env:
@@ -118,70 +218,201 @@ jobs:
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
           ARTIFACT_VERSION: ${{ inputs.artifact-version }}
           ARTIFACT_URI: ${{ inputs.artifact-uri }}
+          ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
           ENVIRONMENT_NAME: ${{ inputs.environment-name }}
+          TARGET_GROUP: ${{ inputs.target-group }}
           SITE_NAME: ${{ inputs.site-name }}
           APP_POOL_NAME: ${{ inputs.app-pool-name }}
           PHYSICAL_PATH: ${{ inputs.physical-path }}
+          BACKUP_ROOT: ${{ inputs.backup-root }}
+          STAGING_ROOT: ${{ inputs.staging-root }}
           HOST_NAME: ${{ inputs.host-name }}
+          HTTP_PORT: ${{ inputs.http-port }}
+          ENABLE_HTTPS: ${{ inputs.enable-https }}
           HTTPS_PORT: ${{ inputs.https-port }}
           CERTIFICATE_THUMBPRINT: ${{ inputs.certificate-thumbprint }}
           AUTHENTICATION_MODE: ${{ inputs.authentication-mode }}
           HEALTH_URL: ${{ inputs.health-url }}
+          HEALTH_VALIDATE_CERTS: ${{ inputs.health-validate-certs }}
           CONFIG_JSON: ${{ inputs.config-json }}
         run: |
           set -euo pipefail
           tool="$(command -v '${{ inputs.tower-command }}')"
+          extra_vars="$(jq -cn \
+            --arg secret_ref "$DEPLOYMENT_SECRET_REF" \
+            --arg artifact_name "$ARTIFACT_NAME" \
+            --arg artifact_version "$ARTIFACT_VERSION" \
+            --arg artifact_uri "$ARTIFACT_URI" \
+            --arg artifact_sha256 "$ARTIFACT_SHA256" \
+            --arg environment "$ENVIRONMENT_NAME" \
+            --arg target_group "$TARGET_GROUP" \
+            --arg site_name "$SITE_NAME" \
+            --arg app_pool_name "$APP_POOL_NAME" \
+            --arg physical_path "$PHYSICAL_PATH" \
+            --arg backup_root "$BACKUP_ROOT" \
+            --arg staging_root "$STAGING_ROOT" \
+            --arg host_name "$HOST_NAME" \
+            --argjson http_port "$HTTP_PORT" \
+            --argjson enable_https "$ENABLE_HTTPS" \
+            --argjson https_port "$HTTPS_PORT" \
+            --arg certificate_thumbprint "$CERTIFICATE_THUMBPRINT" \
+            --arg authentication_mode "$AUTHENTICATION_MODE" \
+            --arg health_url "$HEALTH_URL" \
+            --argjson health_validate_certs "$HEALTH_VALIDATE_CERTS" \
+            --argjson config "$CONFIG_JSON" \
+            '{
+              deployment_secret_ref: $secret_ref,
+              artifact_name: $artifact_name,
+              artifact_version: $artifact_version,
+              artifact_uri: $artifact_uri,
+              artifact_sha256: $artifact_sha256,
+              environment: $environment,
+              target_group: $target_group,
+              iis: {
+                site_name: $site_name,
+                app_pool_name: $app_pool_name,
+                physical_path: $physical_path,
+                backup_root: $backup_root,
+                staging_root: $staging_root,
+                host_name: $host_name,
+                http_port: $http_port,
+                enable_https: $enable_https,
+                https_port: $https_port,
+                certificate_thumbprint: $certificate_thumbprint,
+                authentication_mode: $authentication_mode
+              },
+              config: $config,
+              health_url: $health_url,
+              health_validate_certs: $health_validate_certs
+            }')"
           "$tool" \
             --job-template '${{ inputs.tower-job-template }}' \
             --wait \
-            --extra-vars "$(jq -cn \
-              --arg secret_ref "$DEPLOYMENT_SECRET_REF" \
-              --arg artifact_name "$ARTIFACT_NAME" \
-              --arg artifact_version "$ARTIFACT_VERSION" \
-              --arg artifact_uri "$ARTIFACT_URI" \
-              --arg environment "$ENVIRONMENT_NAME" \
-              --arg site_name "$SITE_NAME" \
-              --arg app_pool_name "$APP_POOL_NAME" \
-              --arg physical_path "$PHYSICAL_PATH" \
-              --arg host_name "$HOST_NAME" \
-              --argjson https_port "$HTTPS_PORT" \
-              --arg certificate_thumbprint "$CERTIFICATE_THUMBPRINT" \
-              --arg authentication_mode "$AUTHENTICATION_MODE" \
-              --arg health_url "$HEALTH_URL" \
-              --argjson config "$CONFIG_JSON" \
-              '{
-                deployment_secret_ref: $secret_ref,
-                artifact_name: $artifact_name,
-                artifact_version: $artifact_version,
-                artifact_uri: $artifact_uri,
-                environment: $environment,
-                iis: {
-                  site_name: $site_name,
-                  app_pool_name: $app_pool_name,
-                  physical_path: $physical_path,
-                  host_name: $host_name,
-                  https_port: $https_port,
-                  certificate_thumbprint: $certificate_thumbprint,
-                  authentication_mode: $authentication_mode
-                },
-                config: $config,
-                health_url: $health_url,
-                deployment_flow: [
-                  "create_site_if_missing",
-                  "backup_existing_site",
-                  "stop_site_and_app_pool",
-                  "download_artifact_from_artifactory",
-                  "deploy_artifact",
-                  "apply_environment_configuration",
-                  "configure_authentication",
-                  "configure_https_certificate",
-                  "start_app_pool_and_site",
-                  "health_check",
-                  "rollback_on_failure"
-                ]
-              }')"
+            --extra-vars "$extra_vars"
+
+      - name: Launch AWX IIS deployment and wait for completion
+        if: inputs.deployment-mode == 'awx-api'
+        id: awx
+        shell: bash
+        env:
+          AWX_BASE_URL: ${{ inputs.awx-base-url }}
+          AWX_JOB_TEMPLATE_ID: ${{ inputs.awx-job-template-id }}
+          AWX_VERIFY_TLS: ${{ inputs.awx-verify-tls }}
+          AWX_TOKEN: ${{ secrets.awx-token }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          ARTIFACT_VERSION: ${{ inputs.artifact-version }}
+          ARTIFACT_URI: ${{ inputs.artifact-uri }}
+          ARTIFACT_SHA256: ${{ inputs.artifact-sha256 }}
+          ENVIRONMENT_NAME: ${{ inputs.environment-name }}
+          TARGET_GROUP: ${{ inputs.target-group }}
+          SITE_NAME: ${{ inputs.site-name }}
+          APP_POOL_NAME: ${{ inputs.app-pool-name }}
+          PHYSICAL_PATH: ${{ inputs.physical-path }}
+          BACKUP_ROOT: ${{ inputs.backup-root }}
+          STAGING_ROOT: ${{ inputs.staging-root }}
+          HOST_NAME: ${{ inputs.host-name }}
+          HTTP_PORT: ${{ inputs.http-port }}
+          ENABLE_HTTPS: ${{ inputs.enable-https }}
+          HTTPS_PORT: ${{ inputs.https-port }}
+          CERTIFICATE_THUMBPRINT: ${{ inputs.certificate-thumbprint }}
+          AUTHENTICATION_MODE: ${{ inputs.authentication-mode }}
+          HEALTH_URL: ${{ inputs.health-url }}
+          HEALTH_VALIDATE_CERTS: ${{ inputs.health-validate-certs }}
+          CONFIG_JSON: ${{ inputs.config-json }}
+        run: |
+          set -euo pipefail
+
+          base="${AWX_BASE_URL%/}"
+          curl_args=(--fail --silent --show-error)
+          if [[ "$AWX_VERIFY_TLS" != "true" ]]; then
+            curl_args+=(-k)
+          fi
+
+          extra_vars="$(jq -cn \
+            --arg artifact_name "$ARTIFACT_NAME" \
+            --arg artifact_version "$ARTIFACT_VERSION" \
+            --arg artifact_uri "$ARTIFACT_URI" \
+            --arg artifact_sha256 "$ARTIFACT_SHA256" \
+            --arg environment "$ENVIRONMENT_NAME" \
+            --arg target_group "$TARGET_GROUP" \
+            --arg site_name "$SITE_NAME" \
+            --arg app_pool_name "$APP_POOL_NAME" \
+            --arg physical_path "$PHYSICAL_PATH" \
+            --arg backup_root "$BACKUP_ROOT" \
+            --arg staging_root "$STAGING_ROOT" \
+            --arg host_name "$HOST_NAME" \
+            --argjson http_port "$HTTP_PORT" \
+            --argjson enable_https "$ENABLE_HTTPS" \
+            --argjson https_port "$HTTPS_PORT" \
+            --arg certificate_thumbprint "$CERTIFICATE_THUMBPRINT" \
+            --arg authentication_mode "$AUTHENTICATION_MODE" \
+            --arg health_url "$HEALTH_URL" \
+            --argjson health_validate_certs "$HEALTH_VALIDATE_CERTS" \
+            --argjson config "$CONFIG_JSON" \
+            '{
+              artifact_name: $artifact_name,
+              artifact_version: $artifact_version,
+              artifact_uri: $artifact_uri,
+              artifact_sha256: $artifact_sha256,
+              environment: $environment,
+              target_group: $target_group,
+              iis: {
+                site_name: $site_name,
+                app_pool_name: $app_pool_name,
+                physical_path: $physical_path,
+                backup_root: $backup_root,
+                staging_root: $staging_root,
+                host_name: $host_name,
+                http_port: $http_port,
+                enable_https: $enable_https,
+                https_port: $https_port,
+                certificate_thumbprint: $certificate_thumbprint,
+                authentication_mode: $authentication_mode
+              },
+              config: $config,
+              health_url: $health_url,
+              health_validate_certs: $health_validate_certs
+            }')"
+
+          payload="$(jq -cn --argjson extra_vars "$extra_vars" '{extra_vars: $extra_vars}')"
+          response="$(curl "${curl_args[@]}" \
+            -X POST \
+            -H "Authorization: Bearer $AWX_TOKEN" \
+            -H 'Content-Type: application/json' \
+            --data "$payload" \
+            "$base/api/v2/job_templates/$AWX_JOB_TEMPLATE_ID/launch/")"
+
+          job_id="$(jq -r '.job // .id // empty' <<<"$response")"
+          test -n "$job_id"
+          echo "AWX job: $job_id"
+          echo "job-id=$job_id" >> "$GITHUB_OUTPUT"
+
+          while true; do
+            job="$(curl "${curl_args[@]}" \
+              -H "Authorization: Bearer $AWX_TOKEN" \
+              "$base/api/v2/jobs/$job_id/")"
+            status="$(jq -r '.status' <<<"$job")"
+            echo "AWX job $job_id status: $status"
+            case "$status" in
+              successful)
+                exit 0
+                ;;
+              failed|error|canceled)
+                echo "AWX deployment failed with status: $status" >&2
+                exit 1
+                ;;
+              new|pending|waiting|running)
+                sleep 5
+                ;;
+              *)
+                echo "Unexpected AWX status: $status" >&2
+                exit 1
+                ;;
+            esac
+          done
 
       - name: Final endpoint check from runner
+        if: inputs.runner-health-check
         shell: bash
         run: |
           set -euo pipefail
