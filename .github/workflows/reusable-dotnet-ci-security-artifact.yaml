@@ -109,7 +109,6 @@ jobs:
     runs-on: ${{ inputs.runner }}
     permissions:
       contents: read
-      id-token: write
     outputs:
       artifact_name: ${{ steps.metadata.outputs.artifact_name }}
       artifact_version: ${{ steps.metadata.outputs.artifact_version }}
