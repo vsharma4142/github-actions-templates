@@ -1,0 +1,276 @@
+---
+name: Reusable AAP Project Bootstrap
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: GitHub runner used to call the AAP SaaS API
+        required: false
+        type: string
+        default: ubuntu-latest
+      aap-base-url:
+        description: AAP platform gateway base URL, for example https://aap.example.com
+        required: true
+        type: string
+      organization-name:
+        description: Existing AAP organization that will own the project
+        required: false
+        type: string
+        default: Default
+      project-name:
+        description: AAP project name
+        required: true
+        type: string
+      project-description:
+        description: AAP project description
+        required: false
+        type: string
+        default: Managed from GitHub Actions for Azure DevOps migration
+      scm-url:
+        description: Git repository URL containing Ansible automation content
+        required: true
+        type: string
+      scm-branch:
+        description: Git branch, tag, commit, or ref synchronized by AAP
+        required: false
+        type: string
+        default: main
+      scm-credential-id:
+        description: Optional AAP Source Control credential numeric ID for private repositories
+        required: false
+        type: string
+        default: ''
+      scm-update-on-launch:
+        description: Update the AAP project from Git before job launches
+        required: false
+        type: boolean
+        default: true
+      allow-branch-override:
+        description: Allow job templates to override the project SCM branch
+        required: false
+        type: boolean
+        default: false
+      verify-tls:
+        description: Verify the AAP gateway TLS certificate
+        required: false
+        type: boolean
+        default: true
+      sync-timeout-seconds:
+        description: Maximum time to wait for project synchronization
+        required: false
+        type: number
+        default: 300
+    secrets:
+      aap-token:
+        description: AAP platform gateway OAuth2/personal access token
+        required: true
+    outputs:
+      project-id:
+        description: AAP project numeric ID
+        value: ${{ jobs.bootstrap.outputs.project-id }}
+      project-api-url:
+        description: AAP controller API URL for the project
+        value: ${{ jobs.bootstrap.outputs.project-api-url }}
+      project-status:
+        description: Final AAP project synchronization status
+        value: ${{ jobs.bootstrap.outputs.project-status }}
+      operation:
+        description: Whether the project was created or updated
+        value: ${{ jobs.bootstrap.outputs.operation }}
+
+jobs:
+  bootstrap:
+    name: Create or update AAP project
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+    outputs:
+      project-id: ${{ steps.project.outputs.project_id }}
+      project-api-url: ${{ steps.project.outputs.project_api_url }}
+      project-status: ${{ steps.project.outputs.project_status }}
+      operation: ${{ steps.project.outputs.operation }}
+
+    steps:
+      - name: Create/update and synchronize AAP project
+        id: project
+        shell: bash
+        env:
+          AAP_BASE_URL: ${{ inputs.aap-base-url }}
+          AAP_TOKEN: ${{ secrets.aap-token }}
+          ORGANIZATION_NAME: ${{ inputs.organization-name }}
+          PROJECT_NAME: ${{ inputs.project-name }}
+          PROJECT_DESCRIPTION: ${{ inputs.project-description }}
+          SCM_URL: ${{ inputs.scm-url }}
+          SCM_BRANCH: ${{ inputs.scm-branch }}
+          SCM_CREDENTIAL_ID: ${{ inputs.scm-credential-id }}
+          SCM_UPDATE_ON_LAUNCH: ${{ inputs.scm-update-on-launch }}
+          ALLOW_BRANCH_OVERRIDE: ${{ inputs.allow-branch-override }}
+          VERIFY_TLS: ${{ inputs.verify-tls }}
+          SYNC_TIMEOUT_SECONDS: ${{ inputs.sync-timeout-seconds }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import ssl
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          base_url = os.environ["AAP_BASE_URL"].strip().rstrip("/")
+          token = os.environ["AAP_TOKEN"].strip()
+          organization_name = os.environ["ORGANIZATION_NAME"].strip()
+          project_name = os.environ["PROJECT_NAME"].strip()
+          project_description = os.environ["PROJECT_DESCRIPTION"].strip()
+          scm_url = os.environ["SCM_URL"].strip()
+          scm_branch = os.environ["SCM_BRANCH"].strip()
+          scm_credential_id = os.environ["SCM_CREDENTIAL_ID"].strip()
+          scm_update_on_launch = os.environ["SCM_UPDATE_ON_LAUNCH"].lower() == "true"
+          allow_branch_override = os.environ["ALLOW_BRANCH_OVERRIDE"].lower() == "true"
+          verify_tls = os.environ["VERIFY_TLS"].lower() == "true"
+          timeout_seconds = int(float(os.environ["SYNC_TIMEOUT_SECONDS"]))
+
+          if not base_url or not token or not organization_name or not project_name or not scm_url:
+              raise SystemExit("AAP URL/token, organization, project name, and SCM URL are required.")
+
+          if "redhat.com/en/products/trials" in base_url:
+              raise SystemExit(
+                  "The Red Hat trial-management URL is not an AAP API endpoint. "
+                  "Use the sandbox platform gateway URL shown after launching the AAP trial."
+              )
+
+          for suffix in ("/api/controller/v2", "/api/controller", "/api/gateway/v1"):
+              if base_url.endswith(suffix):
+                  base_url = base_url[:-len(suffix)]
+                  break
+
+          if not base_url.startswith("https://") and verify_tls:
+              raise SystemExit("AAP base URL must use HTTPS when verify-tls is enabled.")
+
+          ssl_context = ssl.create_default_context() if verify_tls else ssl._create_unverified_context()
+
+          def api(method, path, payload=None, tolerate=()):
+              url = f"{base_url}{path}"
+              body = None if payload is None else json.dumps(payload).encode("utf-8")
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/json",
+                  "Content-Type": "application/json",
+              }
+              request = urllib.request.Request(url, data=body, headers=headers, method=method)
+              try:
+                  with urllib.request.urlopen(request, context=ssl_context, timeout=60) as response:
+                      data = response.read().decode("utf-8")
+                      return response.status, json.loads(data) if data else {}
+              except urllib.error.HTTPError as exc:
+                  response_body = exc.read().decode("utf-8", errors="replace")
+                  if exc.code in tolerate:
+                      return exc.code, {"detail": response_body}
+                  raise SystemExit(f"AAP API {method} {path} failed with HTTP {exc.code}: {response_body}") from exc
+              except urllib.error.URLError as exc:
+                  raise SystemExit(f"Unable to reach AAP gateway {base_url}: {exc}") from exc
+
+          # Confirm that this is an AAP platform gateway/controller endpoint before mutating anything.
+          api("GET", "/api/controller/v2/ping/")
+
+          org_query = urllib.parse.urlencode({"name": organization_name, "page_size": 100})
+          _, organizations = api("GET", f"/api/gateway/v1/organizations/?{org_query}")
+          org_results = organizations.get("results", [])
+          organization = next((item for item in org_results if item.get("name") == organization_name), None)
+          if not organization:
+              names = ", ".join(sorted(item.get("name", "") for item in org_results if item.get("name")))
+              suffix = f" Matching API results: {names}" if names else ""
+              raise SystemExit(f"AAP organization '{organization_name}' was not found.{suffix}")
+
+          organization_id = organization["id"]
+          project_query = urllib.parse.urlencode({
+              "name": project_name,
+              "organization": organization_id,
+              "page_size": 100,
+          })
+          _, projects = api("GET", f"/api/controller/v2/projects/?{project_query}")
+          project = next(
+              (
+                  item for item in projects.get("results", [])
+                  if item.get("name") == project_name and item.get("organization") == organization_id
+              ),
+              None,
+          )
+
+          payload = {
+              "name": project_name,
+              "description": project_description,
+              "organization": organization_id,
+              "scm_type": "git",
+              "scm_url": scm_url,
+              "scm_branch": scm_branch,
+              "scm_clean": True,
+              "scm_delete_on_update": True,
+              "scm_update_on_launch": scm_update_on_launch,
+              "allow_override": allow_branch_override,
+          }
+          if scm_credential_id:
+              payload["credential"] = int(scm_credential_id)
+
+          if project:
+              project_id = project["id"]
+              _, project = api("PATCH", f"/api/controller/v2/projects/{project_id}/", payload)
+              operation = "updated"
+          else:
+              _, project = api("POST", "/api/controller/v2/projects/", payload)
+              project_id = project["id"]
+              operation = "created"
+
+          # A newly created SCM project normally starts an initial sync automatically.
+          # Explicitly request a sync as well; an already-running sync can legitimately return 400/409.
+          api(
+              "POST",
+              f"/api/controller/v2/projects/{project_id}/update/",
+              {},
+              tolerate=(400, 409),
+          )
+
+          deadline = time.monotonic() + timeout_seconds
+          final_status = "unknown"
+          while time.monotonic() < deadline:
+              _, current = api("GET", f"/api/controller/v2/projects/{project_id}/")
+              final_status = current.get("status", "unknown")
+              print(f"AAP project {project_id} status: {final_status}")
+              if final_status == "successful":
+                  break
+              if final_status in {"failed", "error", "canceled"}:
+                  raise SystemExit(f"AAP project synchronization finished with status '{final_status}'.")
+              time.sleep(5)
+          else:
+              raise SystemExit(
+                  f"Timed out after {timeout_seconds}s waiting for AAP project {project_id} synchronization."
+              )
+
+          project_api_url = f"{base_url}/api/controller/v2/projects/{project_id}/"
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"project_id={project_id}\n")
+              output.write(f"project_api_url={project_api_url}\n")
+              output.write(f"project_status={final_status}\n")
+              output.write(f"operation={operation}\n")
+
+          print(
+              f"AAP project '{project_name}' {operation} and synchronized successfully "
+              f"from {scm_url}@{scm_branch}."
+          )
+          PY
+
+      - name: Publish bootstrap summary
+        shell: bash
+        run: |
+          {
+            echo "### AAP project bootstrap"
+            echo ""
+            echo "- Operation: ${{ steps.project.outputs.operation }}"
+            echo "- Project ID: ${{ steps.project.outputs.project_id }}"
+            echo "- Status: ${{ steps.project.outputs.project_status }}"
+            echo "- SCM: ${{ inputs.scm-url }} @ ${{ inputs.scm-branch }}"
+          } >> "$GITHUB_STEP_SUMMARY"
