@@ -1,0 +1,274 @@
+---
+name: Reusable .NET CI Security Artifact
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: Runner label used by the enterprise build pool
+        required: false
+        type: string
+        default: windows-latest
+      solution-path:
+        description: Solution to restore and build
+        required: true
+        type: string
+      web-project-path:
+        description: Web project to publish into the immutable deployment artifact
+        required: true
+        type: string
+      test-project-path:
+        description: Test project or solution passed to dotnet test
+        required: true
+        type: string
+      dotnet-version:
+        description: .NET SDK version understood by actions/setup-dotnet
+        required: true
+        type: string
+      build-configuration:
+        description: Build configuration
+        required: false
+        type: string
+        default: Release
+      coverage-threshold:
+        description: Minimum line coverage percentage
+        required: false
+        type: number
+        default: 80
+      max-high-vulnerabilities:
+        description: Maximum allowed high-severity vulnerabilities
+        required: false
+        type: number
+        default: 0
+      max-critical-vulnerabilities:
+        description: Maximum allowed critical-severity vulnerabilities
+        required: false
+        type: number
+        default: 0
+      artifact-name:
+        description: Logical application artifact name
+        required: true
+        type: string
+      artifact-version-prefix:
+        description: Prefix used when creating the immutable artifact version
+        required: false
+        type: string
+        default: 1.0
+      artifactory-repository:
+        description: Target Artifactory repository/path consumed by the enterprise wrapper
+        required: false
+        type: string
+        default: ''
+      security-mode:
+        description: enterprise executes wrappers; lab-dummy emits deterministic zero-finding reports
+        required: false
+        type: string
+        default: enterprise
+      artifact-provider:
+        description: artifactory or github-actions
+        required: false
+        type: string
+        default: artifactory
+      checkmarx-command:
+        description: Enterprise Checkmarx wrapper executable available on the runner
+        required: false
+        type: string
+        default: enterprise-checkmarx-scan
+      snyk-command:
+        description: Enterprise Snyk wrapper executable available on the runner
+        required: false
+        type: string
+        default: enterprise-snyk-scan
+      nexus-iq-command:
+        description: Enterprise Nexus IQ wrapper executable available on the runner
+        required: false
+        type: string
+        default: enterprise-nexus-iq-scan
+      artifactory-command:
+        description: Enterprise Artifactory wrapper executable available on the runner
+        required: false
+        type: string
+        default: enterprise-artifactory-upload
+    outputs:
+      artifact_name:
+        description: Artifact name published by this workflow
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_name }}
+      artifact_version:
+        description: Immutable artifact version published by this workflow
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_version }}
+      artifact_uri:
+        description: Artifactory URI returned by the enterprise upload wrapper
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_uri }}
+      artifact_sha256:
+        description: SHA-256 digest of the immutable ZIP
+        value: ${{ jobs.build_test_scan_package.outputs.artifact_sha256 }}
+
+jobs:
+  build_test_scan_package:
+    name: Build, test, scan, package, publish
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+      artifact_version: ${{ steps.metadata.outputs.artifact_version }}
+      artifact_uri: ${{ steps.artifactory.outputs.artifact_uri }}
+      artifact_sha256: ${{ steps.package.outputs.artifact_sha256 }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Restore
+        shell: pwsh
+        run: dotnet restore "${{ inputs.solution-path }}"
+
+      - name: Build
+        shell: pwsh
+        run: >-
+          dotnet build "${{ inputs.solution-path }}"
+          --configuration "${{ inputs.build-configuration }}"
+          --no-restore
+
+      - name: Unit tests with coverage
+        shell: pwsh
+        run: >-
+          dotnet test "${{ inputs.test-project-path }}"
+          --configuration "${{ inputs.build-configuration }}"
+          --no-build
+          --collect:"XPlat Code Coverage"
+          --results-directory "${{ runner.temp }}/test-results"
+
+      - name: Enforce unit-test coverage
+        shell: pwsh
+        env:
+          COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
+        run: |
+          $coverageFile = Get-ChildItem "${{ runner.temp }}/test-results" -Recurse -Filter coverage.cobertura.xml | Select-Object -First 1
+          if (-not $coverageFile) {
+            throw "coverage.cobertura.xml was not produced. Ensure coverlet.collector is referenced by the test project."
+          }
+          [xml]$coverage = Get-Content $coverageFile.FullName
+          $lineRate = [double]$coverage.coverage.'line-rate'
+          $percent = [math]::Round($lineRate * 100, 2)
+          Write-Host "Line coverage: $percent% (required: $env:COVERAGE_THRESHOLD%)"
+          if ($percent -lt [double]$env:COVERAGE_THRESHOLD) {
+            throw "Unit-test coverage gate failed: $percent% < $env:COVERAGE_THRESHOLD%"
+          }
+
+      - name: Checkmarx security gate
+        if: inputs.security-mode == 'enterprise'
+        shell: pwsh
+        env:
+          MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
+          MAX_CRITICAL: ${{ inputs.max-critical-vulnerabilities }}
+        run: |
+          $tool = Get-Command "${{ inputs.checkmarx-command }}" -ErrorAction Stop
+          & $tool.Source --source "." --project "${{ github.repository }}" --branch "${{ github.ref_name }}" --max-high $env:MAX_HIGH --max-critical $env:MAX_CRITICAL
+          if ($LASTEXITCODE -ne 0) { throw "Checkmarx security gate failed." }
+
+      - name: Snyk security gate
+        if: inputs.security-mode == 'enterprise'
+        shell: pwsh
+        env:
+          MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
+          MAX_CRITICAL: ${{ inputs.max-critical-vulnerabilities }}
+        run: |
+          $tool = Get-Command "${{ inputs.snyk-command }}" -ErrorAction Stop
+          & $tool.Source --source "." --project "${{ github.repository }}" --max-high $env:MAX_HIGH --max-critical $env:MAX_CRITICAL
+          if ($LASTEXITCODE -ne 0) { throw "Snyk security gate failed." }
+
+      - name: Nexus IQ policy gate
+        if: inputs.security-mode == 'enterprise'
+        shell: pwsh
+        env:
+          MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
+          MAX_CRITICAL: ${{ inputs.max-critical-vulnerabilities }}
+        run: |
+          $tool = Get-Command "${{ inputs.nexus-iq-command }}" -ErrorAction Stop
+          & $tool.Source --source "." --application "${{ github.event.repository.name }}" --max-high $env:MAX_HIGH --max-critical $env:MAX_CRITICAL
+          if ($LASTEXITCODE -ne 0) { throw "Nexus IQ policy gate failed." }
+
+      - name: Validate lab security mode
+        if: inputs.security-mode != 'enterprise' && inputs.security-mode != 'lab-dummy'
+        shell: pwsh
+        run: throw "security-mode must be 'enterprise' or 'lab-dummy'."
+
+      - name: Run deterministic lab security gates
+        if: inputs.security-mode == 'lab-dummy'
+        shell: pwsh
+        env:
+          MAX_HIGH: ${{ inputs.max-high-vulnerabilities }}
+          MAX_CRITICAL: ${{ inputs.max-critical-vulnerabilities }}
+        run: |
+          $report = @{
+            mode = 'lab-dummy'
+            checkmarx = @{ high = 0; critical = 0 }
+            snyk = @{ high = 0; critical = 0 }
+            nexusIq = @{ high = 0; critical = 0 }
+          }
+          $report | ConvertTo-Json -Depth 4 | Set-Content "${{ runner.temp }}/lab-security-report.json"
+          if (0 -gt [int]$env:MAX_HIGH -or 0 -gt [int]$env:MAX_CRITICAL) {
+            throw 'Lab security threshold is invalid.'
+          }
+          Write-Host 'LAB ONLY: Checkmarx, Snyk, and Nexus IQ returned zero deterministic findings.'
+
+      - name: Create immutable artifact metadata
+        id: metadata
+        shell: pwsh
+        run: |
+          $shortSha = "${{ github.sha }}".Substring(0, 8)
+          $version = "${{ inputs.artifact-version-prefix }}.${{ github.run_number }}-$shortSha"
+          "artifact_name=${{ inputs.artifact-name }}" >> $env:GITHUB_OUTPUT
+          "artifact_version=$version" >> $env:GITHUB_OUTPUT
+          "ARTIFACT_VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Publish web application
+        shell: pwsh
+        run: >-
+          dotnet publish "${{ inputs.web-project-path }}"
+          --configuration "${{ inputs.build-configuration }}"
+          --no-build
+          --output "${{ runner.temp }}/publish"
+
+      - name: Package immutable artifact
+        id: package
+        shell: pwsh
+        run: |
+          $zip = "${{ runner.temp }}/${{ inputs.artifact-name }}-$env:ARTIFACT_VERSION.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "${{ runner.temp }}/publish/*" -DestinationPath $zip
+          $sha256 = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "ARTIFACT_FILE=$zip" >> $env:GITHUB_ENV
+          "artifact_sha256=$sha256" >> $env:GITHUB_OUTPUT
+
+      - name: Publish artifact to Artifactory
+        if: inputs.artifact-provider == 'artifactory'
+        id: artifactory
+        shell: pwsh
+        run: |
+          $tool = Get-Command "${{ inputs.artifactory-command }}" -ErrorAction Stop
+          $uri = & $tool.Source --file "$env:ARTIFACT_FILE" --repository "${{ inputs.artifactory-repository }}" --name "${{ inputs.artifact-name }}" --version "$env:ARTIFACT_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "Artifactory publication failed." }
+          $uri = ($uri | Select-Object -Last 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($uri)) { throw "Artifactory wrapper did not return an artifact URI." }
+          "artifact_uri=$uri" >> $env:GITHUB_OUTPUT
+
+      - name: Publish immutable GitHub Actions artifact
+        if: inputs.artifact-provider == 'github-actions'
+        uses: actions/upload-artifact@v4
+        with:
+          name: immutable-iis-package
+          path: ${{ env.ARTIFACT_FILE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Validate artifact provider
+        if: inputs.artifact-provider != 'artifactory' && inputs.artifact-provider != 'github-actions'
+        shell: pwsh
+        run: throw "artifact-provider must be 'artifactory' or 'github-actions'."

@@ -1,0 +1,298 @@
+---
+- name: Deploy immutable application artifact to Windows IIS
+  hosts: "{{ target_group | default('iis_targets') }}"
+  gather_facts: false
+  vars:
+    iis_defaults:
+      site_name: MigrationLab
+      app_pool_name: MigrationLabPool
+      physical_path: 'C:\MigrationLab\wwwroot'
+      backup_root: 'C:\MigrationLab\backups'
+      staging_root: 'C:\MigrationLab\staging'
+      host_name: ''
+      http_port: 8080
+      enable_https: false
+      https_port: 443
+      certificate_thumbprint: ''
+      authentication_mode: Anonymous
+      managed_runtime_version: ''
+      config_files:
+        - appsettings.json
+        - web.config
+    effective_iis: "{{ iis_defaults | combine(iis | default({}), recursive=True) }}"
+    artifact_file: "{{ effective_iis.staging_root }}\\{{ artifact_name }}-{{ artifact_version }}.zip"
+    extract_path: "{{ effective_iis.staging_root }}\\{{ artifact_name }}-{{ artifact_version }}"
+    backup_file: "{{ effective_iis.backup_root }}\\{{ effective_iis.site_name }}-{{ artifact_version }}.zip"
+    effective_config: "{{ (config | default({})) | combine(secret_config | default({}), recursive=True) }}"
+
+  pre_tasks:
+    - name: Validate deployment contract
+      ansible.builtin.assert:
+        that:
+          - artifact_name | length > 0
+          - artifact_version | length > 0
+          - artifact_uri | length > 0
+          - health_url | length > 0
+          - effective_iis.site_name | length > 0
+          - effective_iis.app_pool_name | length > 0
+          - effective_iis.physical_path | length > 0
+        fail_msg: Required immutable artifact or IIS deployment values are missing.
+
+    - name: Ensure deployment directories exist
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ effective_iis.physical_path }}"
+        - "{{ effective_iis.backup_root }}"
+        - "{{ effective_iis.staging_root }}"
+
+    - name: Verify IIS AppCmd is available
+      ansible.windows.win_stat:
+        path: 'C:\Windows\System32\inetsrv\appcmd.exe'
+      register: appcmd
+
+    - name: Fail when IIS is not installed
+      ansible.builtin.assert:
+        that:
+          - appcmd.stat.exists
+        fail_msg: IIS AppCmd.exe is unavailable. Install/enable IIS before deployment.
+
+    - name: Ensure IIS application pool and site exist
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $appcmd = "$env:WINDIR\System32\inetsrv\appcmd.exe"
+
+          $pool = & $appcmd list apppool "/name:$env:APP_POOL_NAME" 2>$null
+          if (-not $pool) {
+            & $appcmd add apppool "/name:$env:APP_POOL_NAME"
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to create IIS application pool.' }
+          }
+
+          & $appcmd set apppool "/apppool.name:$env:APP_POOL_NAME" "/managedRuntimeVersion:$env:MANAGED_RUNTIME_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to configure IIS application pool.' }
+
+          $site = & $appcmd list site "/name:$env:SITE_NAME" 2>$null
+          if (-not $site) {
+            $binding = "http/*:$env:HTTP_PORT:$env:HOST_NAME"
+            & $appcmd add site "/name:$env:SITE_NAME" "/bindings:$binding" "/physicalPath:$env:PHYSICAL_PATH"
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to create IIS site.' }
+          }
+
+          & $appcmd set app "$env:SITE_NAME/" "/applicationPool:$env:APP_POOL_NAME"
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to attach IIS site to application pool.' }
+      environment:
+        APP_POOL_NAME: "{{ effective_iis.app_pool_name }}"
+        SITE_NAME: "{{ effective_iis.site_name }}"
+        PHYSICAL_PATH: "{{ effective_iis.physical_path }}"
+        HTTP_PORT: "{{ effective_iis.http_port | string }}"
+        HOST_NAME: "{{ effective_iis.host_name }}"
+        MANAGED_RUNTIME_VERSION: "{{ effective_iis.managed_runtime_version }}"
+
+    - name: Remove previous staging extraction
+      ansible.windows.win_file:
+        path: "{{ extract_path }}"
+        state: absent
+
+    - name: Recreate staging extraction directory
+      ansible.windows.win_file:
+        path: "{{ extract_path }}"
+        state: directory
+
+    - name: Download exact immutable artifact
+      ansible.windows.win_get_url:
+        url: "{{ artifact_uri }}"
+        dest: "{{ artifact_file }}"
+        force: true
+        checksum: "{{ artifact_sha256 | default(omit, true) }}"
+        checksum_algorithm: sha256
+        url_username: "{{ artifact_url_username | default(lookup('ansible.builtin.env', 'ARTIFACTORY_USERNAME'), true) | default(omit, true) }}"
+        url_password: "{{ artifact_url_password | default(lookup('ansible.builtin.env', 'ARTIFACTORY_PASSWORD'), true) | default(omit, true) }}"
+
+    - name: Expand immutable artifact into staging
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive -LiteralPath $env:ARTIFACT_FILE -DestinationPath $env:EXTRACT_PATH -Force
+      environment:
+        ARTIFACT_FILE: "{{ artifact_file }}"
+        EXTRACT_PATH: "{{ extract_path }}"
+
+  tasks:
+    - name: Deploy application and validate IIS endpoint
+      block:
+        - name: Backup currently deployed site content
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              if (Test-Path -LiteralPath $env:BACKUP_FILE) {
+                Remove-Item -LiteralPath $env:BACKUP_FILE -Force
+              }
+              $items = Get-ChildItem -LiteralPath $env:PHYSICAL_PATH -Force -ErrorAction SilentlyContinue
+              if ($items) {
+                Compress-Archive -Path "$env:PHYSICAL_PATH\*" -DestinationPath $env:BACKUP_FILE -Force
+              }
+          environment:
+            PHYSICAL_PATH: "{{ effective_iis.physical_path }}"
+            BACKUP_FILE: "{{ backup_file }}"
+
+        - name: Stop IIS site and application pool
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Continue'
+              $appcmd = "$env:WINDIR\System32\inetsrv\appcmd.exe"
+              & $appcmd stop site "/site.name:$env:SITE_NAME" | Out-Null
+              & $appcmd stop apppool "/apppool.name:$env:APP_POOL_NAME" | Out-Null
+          environment:
+            SITE_NAME: "{{ effective_iis.site_name }}"
+            APP_POOL_NAME: "{{ effective_iis.app_pool_name }}"
+
+        - name: Replace deployed content with staged immutable artifact
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              Get-ChildItem -LiteralPath $env:PHYSICAL_PATH -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+              Copy-Item -Path "$env:EXTRACT_PATH\*" -Destination $env:PHYSICAL_PATH -Recurse -Force
+          environment:
+            PHYSICAL_PATH: "{{ effective_iis.physical_path }}"
+            EXTRACT_PATH: "{{ extract_path }}"
+
+        - name: Apply environment-specific configuration substitutions
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $target = Join-Path $env:PHYSICAL_PATH $env:RELATIVE_PATH
+              if (-not (Test-Path -LiteralPath $target)) { return }
+
+              $content = Get-Content -LiteralPath $target -Raw
+              $values = $env:REPLACEMENTS_JSON | ConvertFrom-Json
+              foreach ($property in $values.PSObject.Properties) {
+                $token = "__$($property.Name)__"
+                $content = $content.Replace($token, [string]$property.Value)
+              }
+              Set-Content -LiteralPath $target -Value $content -NoNewline
+          environment:
+            PHYSICAL_PATH: "{{ effective_iis.physical_path }}"
+            RELATIVE_PATH: "{{ item }}"
+            REPLACEMENTS_JSON: "{{ effective_config | to_json }}"
+          loop: "{{ effective_iis.config_files }}"
+          no_log: true
+
+        - name: Configure IIS authentication
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $appcmd = "$env:WINDIR\System32\inetsrv\appcmd.exe"
+              if ($env:AUTHENTICATION_MODE -eq 'Anonymous') {
+                & $appcmd set config "$env:SITE_NAME" -section:system.webServer/security/authentication/anonymousAuthentication /enabled:true /commit:apphost
+                & $appcmd set config "$env:SITE_NAME" -section:system.webServer/security/authentication/windowsAuthentication /enabled:false /commit:apphost
+              }
+              elseif ($env:AUTHENTICATION_MODE -eq 'Windows') {
+                & $appcmd set config "$env:SITE_NAME" -section:system.webServer/security/authentication/anonymousAuthentication /enabled:false /commit:apphost
+                & $appcmd set config "$env:SITE_NAME" -section:system.webServer/security/authentication/windowsAuthentication /enabled:true /commit:apphost
+              }
+              elseif ($env:AUTHENTICATION_MODE -ne 'Unchanged') {
+                throw "Unsupported authentication mode: $env:AUTHENTICATION_MODE"
+              }
+          environment:
+            SITE_NAME: "{{ effective_iis.site_name }}"
+            AUTHENTICATION_MODE: "{{ effective_iis.authentication_mode }}"
+
+        - name: Configure HTTPS binding and certificate when requested
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_THUMBPRINT)) {
+                throw 'certificate_thumbprint is required when HTTPS is enabled.'
+              }
+
+              Add-Type -Path "$env:WINDIR\System32\inetsrv\Microsoft.Web.Administration.dll"
+              $manager = New-Object Microsoft.Web.Administration.ServerManager
+              $site = $manager.Sites[$env:SITE_NAME]
+              if (-not $site) { throw "IIS site '$env:SITE_NAME' was not found." }
+
+              $bindingInfo = "*:$env:HTTPS_PORT:$env:HOST_NAME"
+              $binding = $site.Bindings | Where-Object {
+                $_.Protocol -eq 'https' -and $_.BindingInformation -eq $bindingInfo
+              } | Select-Object -First 1
+
+              if (-not $binding) {
+                $binding = $site.Bindings.Add($bindingInfo, 'https')
+              }
+
+              $cert = Get-Item -LiteralPath "Cert:\LocalMachine\My\$env:CERTIFICATE_THUMBPRINT"
+              $binding.CertificateHash = $cert.GetCertHash()
+              $binding.CertificateStoreName = 'My'
+              $manager.CommitChanges()
+          environment:
+            SITE_NAME: "{{ effective_iis.site_name }}"
+            HTTPS_PORT: "{{ effective_iis.https_port | string }}"
+            HOST_NAME: "{{ effective_iis.host_name }}"
+            CERTIFICATE_THUMBPRINT: "{{ effective_iis.certificate_thumbprint }}"
+          when: effective_iis.enable_https | bool
+
+        - name: Start IIS application pool and site
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              $appcmd = "$env:WINDIR\System32\inetsrv\appcmd.exe"
+              & $appcmd start apppool "/apppool.name:$env:APP_POOL_NAME"
+              if ($LASTEXITCODE -ne 0) { throw 'Unable to start IIS application pool.' }
+              & $appcmd start site "/site.name:$env:SITE_NAME"
+              if ($LASTEXITCODE -ne 0) { throw 'Unable to start IIS site.' }
+          environment:
+            SITE_NAME: "{{ effective_iis.site_name }}"
+            APP_POOL_NAME: "{{ effective_iis.app_pool_name }}"
+
+        - name: Validate application health from IIS host
+          ansible.windows.win_uri:
+            url: "{{ health_url }}"
+            method: GET
+            status_code: 200
+            validate_certs: "{{ health_validate_certs | default(true) | bool }}"
+          register: deployment_health
+          retries: "{{ health_retries | default(12) | int }}"
+          delay: "{{ health_delay_seconds | default(5) | int }}"
+          until: deployment_health.status_code == 200
+
+      rescue:
+        - name: Stop failed IIS deployment before rollback
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Continue'
+              $appcmd = "$env:WINDIR\System32\inetsrv\appcmd.exe"
+              & $appcmd stop site "/site.name:$env:SITE_NAME" | Out-Null
+              & $appcmd stop apppool "/apppool.name:$env:APP_POOL_NAME" | Out-Null
+          environment:
+            SITE_NAME: "{{ effective_iis.site_name }}"
+            APP_POOL_NAME: "{{ effective_iis.app_pool_name }}"
+
+        - name: Restore last backup when available
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Stop'
+              Get-ChildItem -LiteralPath $env:PHYSICAL_PATH -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force
+              if (Test-Path -LiteralPath $env:BACKUP_FILE) {
+                Expand-Archive -LiteralPath $env:BACKUP_FILE -DestinationPath $env:PHYSICAL_PATH -Force
+              }
+          environment:
+            PHYSICAL_PATH: "{{ effective_iis.physical_path }}"
+            BACKUP_FILE: "{{ backup_file }}"
+
+        - name: Restart IIS after rollback
+          ansible.windows.win_powershell:
+            script: |
+              $ErrorActionPreference = 'Continue'
+              $appcmd = "$env:WINDIR\System32\inetsrv\appcmd.exe"
+              & $appcmd start apppool "/apppool.name:$env:APP_POOL_NAME" | Out-Null
+              & $appcmd start site "/site.name:$env:SITE_NAME" | Out-Null
+          environment:
+            SITE_NAME: "{{ effective_iis.site_name }}"
+            APP_POOL_NAME: "{{ effective_iis.app_pool_name }}"
+
+        - name: Mark deployment failed after rollback
+          ansible.builtin.fail:
+            msg: IIS deployment failed. Previous content was restored when a backup was available.

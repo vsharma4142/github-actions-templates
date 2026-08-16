@@ -1,0 +1,34 @@
+---
+name: Launch MigrationLab IIS Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact-uri:
+        description: Immutable ZIP download URL
+        required: true
+        type: string
+      artifact-version:
+        description: Immutable artifact version
+        required: true
+        type: string
+      artifact-sha256:
+        description: SHA-256 digest of the ZIP
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  launch:
+    uses: vsharma4142/github-actions-templates/.github/workflows/reusable-aap-job-launch.yaml@migration/enterprise-dotnet-iis-pilot
+    with:
+      job-template-id: ${{ vars.AAP_IIS_JOB_TEMPLATE_ID }}
+      environment-name: Dev
+      extra-vars-json: >-
+        {"target_group":"iis_targets","artifact_name":"heliosmigration","artifact_version":"${{ inputs.artifact-version }}","artifact_uri":"${{ inputs.artifact-uri }}","artifact_sha256":"${{ inputs.artifact-sha256 }}","environment":"Dev","iis":{"site_name":"MigrationLab","app_pool_name":"MigrationLabPool","physical_path":"C:\\MigrationLab\\wwwroot","http_port":8080},"config":{"EnvironmentName":"Development","WelcomeMessage":"HeliosMigration development deployment is healthy","SupportEmail":"helios-dev@example.invalid","ReleaseLabel":"dev"},"health_url":"http://localhost:8080/health","health_validate_certs":false}
+    secrets:
+      aap-base-url: ${{ secrets.AAP_BASE_URL }}
+      aap-token: ${{ secrets.AAP_TOKEN }}
+      iis-host: ${{ secrets.IIS_HOST }}

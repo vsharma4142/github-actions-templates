@@ -1,0 +1,63 @@
+---
+name: Migrated IIS deployment through AWX
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        required: true
+        type: string
+      artifact-version:
+        required: true
+        type: string
+      artifact-uri:
+        required: true
+        type: string
+      artifact-sha256:
+        required: false
+        type: string
+        default: ''
+    secrets:
+      awx-token:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-development:
+    name: Deploy immutable artifact to MigrationLab IIS
+    uses: vsharma4142/github-actions-templates/.github/workflows/reusable-iis-tower-deploy.yaml@migration/enterprise-dotnet-iis-pilot
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      # Local AWX is private to the laptop/WSL network. Use a runner that can reach it.
+      runner: ${{ vars.DEPLOY_RUNNER || 'self-hosted' }}
+      environment-name: development
+      deployment-mode: awx-api
+      artifact-name: ${{ inputs.artifact-name }}
+      artifact-version: ${{ inputs.artifact-version }}
+      artifact-uri: ${{ inputs.artifact-uri }}
+      artifact-sha256: ${{ inputs.artifact-sha256 }}
+      awx-base-url: ${{ vars.AWX_BASE_URL }}
+      awx-job-template-id: ${{ vars.AWX_IIS_JOB_TEMPLATE_ID }}
+      awx-verify-tls: ${{ fromJSON(vars.AWX_VERIFY_TLS || 'false') }}
+      target-group: ${{ vars.AWX_IIS_TARGET_GROUP || 'iis_targets' }}
+      site-name: ${{ vars.DEV_IIS_SITE_NAME || 'MigrationLab' }}
+      app-pool-name: ${{ vars.DEV_IIS_APP_POOL || 'MigrationLabPool' }}
+      physical-path: ${{ vars.DEV_IIS_PHYSICAL_PATH || 'C:\MigrationLab\wwwroot' }}
+      backup-root: ${{ vars.DEV_IIS_BACKUP_ROOT || 'C:\MigrationLab\backups' }}
+      staging-root: ${{ vars.DEV_IIS_STAGING_ROOT || 'C:\MigrationLab\staging' }}
+      host-name: ${{ vars.DEV_IIS_HOST_NAME || '' }}
+      http-port: ${{ fromJSON(vars.DEV_HTTP_PORT || '8080') }}
+      enable-https: ${{ fromJSON(vars.DEV_ENABLE_HTTPS || 'false') }}
+      https-port: ${{ fromJSON(vars.DEV_HTTPS_PORT || '443') }}
+      certificate-thumbprint: ${{ vars.DEV_SSL_CERTIFICATE_REF || '' }}
+      authentication-mode: ${{ vars.DEV_AUTHENTICATION_MODE || 'Anonymous' }}
+      health-url: ${{ vars.DEV_HEALTH_URL || 'http://localhost:8080' }}
+      health-validate-certs: ${{ fromJSON(vars.DEV_HEALTH_VALIDATE_CERTS || 'false') }}
+      config-json: ${{ vars.DEV_CONFIG_JSON || '{}' }}
+      runner-health-check: ${{ fromJSON(vars.RUNNER_HEALTH_CHECK || 'false') }}
+    secrets:
+      awx-token: ${{ secrets.awx-token }}

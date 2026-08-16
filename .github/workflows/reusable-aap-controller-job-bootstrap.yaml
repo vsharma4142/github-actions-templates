@@ -1,0 +1,229 @@
+---
+name: Reusable AAP Controller Job Bootstrap
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: GitHub runner used to call AAP
+        required: false
+        type: string
+        default: ubuntu-latest
+      organization-name:
+        description: AAP organization
+        required: false
+        type: string
+        default: Default
+      inventory-name:
+        description: Inventory to create or update
+        required: false
+        type: string
+        default: MigrationLab Inventory
+      project-name:
+        description: Existing AAP project name
+        required: false
+        type: string
+        default: github-actions-templates
+      credential-name:
+        description: Existing AAP machine credential
+        required: false
+        type: string
+        default: MigrationLab WinRM
+      job-template-name:
+        description: Controller job template name
+        required: false
+        type: string
+        default: Deploy HeliosMigration to MigrationLab IIS
+      playbook:
+        description: Playbook path inside the AAP project
+        required: false
+        type: string
+        default: ansible/iis/deploy-iis.yml
+      execution-environment-name:
+        description: Optional execution environment containing ansible.windows and pypsrp
+        required: false
+        type: string
+        default: ''
+      winrm-ca-cert-path:
+        description: Optional CA PEM path inside the AAP execution environment
+        required: false
+        type: string
+        default: ''
+      verify-tls:
+        description: Verify the AAP gateway TLS certificate
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      aap-base-url:
+        description: AAP platform gateway URL
+        required: true
+      aap-token:
+        description: Rotated AAP API token
+        required: true
+      iis-host:
+        description: Windows inventory host name or routable address
+        required: true
+      winrm-port:
+        description: WinRM HTTPS port; must be 5986 for this secure lab profile
+        required: true
+    outputs:
+      inventory-id:
+        description: AAP inventory numeric ID
+        value: ${{ jobs.controller.outputs.inventory-id }}
+      host-id:
+        description: AAP host numeric ID
+        value: ${{ jobs.controller.outputs.host-id }}
+      job-template-id:
+        description: AAP job template numeric ID
+        value: ${{ jobs.controller.outputs.job-template-id }}
+
+jobs:
+  controller:
+    name: Create inventory, host, and job template
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+    outputs:
+      inventory-id: ${{ steps.controller.outputs.inventory_id }}
+      host-id: ${{ steps.controller.outputs.host_id }}
+      job-template-id: ${{ steps.controller.outputs.job_template_id }}
+    steps:
+      - name: Bootstrap AAP controller objects
+        id: controller
+        shell: bash
+        env:
+          AAP_BASE_URL: ${{ secrets.aap-base-url }}
+          AAP_TOKEN: ${{ secrets.aap-token }}
+          ORGANIZATION_NAME: ${{ inputs.organization-name }}
+          INVENTORY_NAME: ${{ inputs.inventory-name }}
+          HOST_NAME: ${{ secrets.iis-host }}
+          WINRM_PORT: ${{ secrets.winrm-port }}
+          WINRM_CA_CERT_PATH: ${{ inputs.winrm-ca-cert-path }}
+          PROJECT_NAME: ${{ inputs.project-name }}
+          CREDENTIAL_NAME: ${{ inputs.credential-name }}
+          JOB_TEMPLATE_NAME: ${{ inputs.job-template-name }}
+          PLAYBOOK: ${{ inputs.playbook }}
+          EXECUTION_ENVIRONMENT_NAME: ${{ inputs.execution-environment-name }}
+          VERIFY_TLS: ${{ inputs.verify-tls }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import ssl
+          import urllib.parse
+          import urllib.request
+
+          base = os.environ["AAP_BASE_URL"].rstrip("/")
+          token = os.environ["AAP_TOKEN"]
+          context = ssl.create_default_context() if os.environ["VERIFY_TLS"].lower() == "true" else ssl._create_unverified_context()
+
+          def api(method, path, payload=None):
+              body = None if payload is None else json.dumps(payload).encode()
+              request = urllib.request.Request(
+                  f"{base}{path}", data=body, method=method,
+                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+              with urllib.request.urlopen(request, context=context, timeout=60) as response:
+                  content = response.read().decode()
+                  return json.loads(content) if content else {}
+
+          def exact(endpoint, name, **filters):
+              query = urllib.parse.urlencode({"name": name, **filters})
+              results = api("GET", f"/api/controller/v2/{endpoint}/?{query}").get("results", [])
+              return next((x for x in results if x.get("name") == name), None)
+
+          api("GET", "/api/controller/v2/ping/")
+          org_name = os.environ["ORGANIZATION_NAME"]
+          organization = exact("organizations", org_name)
+          if not organization:
+              raise SystemExit(f"AAP organization '{org_name}' was not found")
+          org_id = organization["id"]
+
+          inventory_name = os.environ["INVENTORY_NAME"]
+          inventory = exact("inventories", inventory_name, organization=org_id)
+          inventory_payload = {
+              "name": inventory_name,
+              "description": "Windows IIS lab inventory managed by GitHub Actions",
+              "organization": org_id,
+          }
+          if inventory:
+              inventory = api("PATCH", f"/api/controller/v2/inventories/{inventory['id']}/", inventory_payload)
+          else:
+              inventory = api("POST", "/api/controller/v2/inventories/", inventory_payload)
+
+          host_name = os.environ["HOST_NAME"]
+          winrm_port = int(os.environ["WINRM_PORT"])
+          if winrm_port != 5986:
+              raise SystemExit("Secure MigrationLab profile requires WinRM over HTTPS on port 5986")
+          host = exact("hosts", host_name, inventory=inventory["id"])
+          host_vars = {
+              "ansible_host": host_name,
+              "ansible_port": winrm_port,
+              "ansible_connection": "psrp",
+              "ansible_psrp_protocol": "https",
+              "ansible_psrp_auth": "negotiate",
+              "ansible_psrp_cert_validation": "validate",
+              "ansible_psrp_negotiate_send_cbt": True,
+              "ansible_shell_type": "powershell",
+          }
+          ca_cert_path = os.environ["WINRM_CA_CERT_PATH"].strip()
+          if ca_cert_path:
+              host_vars["ansible_psrp_ca_cert"] = ca_cert_path
+          host_payload = {
+              "name": host_name,
+              "inventory": inventory["id"],
+              "enabled": True,
+              "variables": json.dumps(host_vars, indent=2),
+          }
+          if host:
+              host = api("PATCH", f"/api/controller/v2/hosts/{host['id']}/", host_payload)
+          else:
+              host = api("POST", "/api/controller/v2/hosts/", host_payload)
+
+          group = exact("groups", "iis_targets", inventory=inventory["id"])
+          group_payload = {
+              "name": "iis_targets",
+              "description": "Windows IIS deployment targets",
+              "inventory": inventory["id"],
+          }
+          if group:
+              group = api("PATCH", f"/api/controller/v2/groups/{group['id']}/", group_payload)
+          else:
+              group = api("POST", "/api/controller/v2/groups/", group_payload)
+          api("POST", f"/api/controller/v2/groups/{group['id']}/hosts/", {"id": host["id"]})
+
+          project = exact("projects", os.environ["PROJECT_NAME"], organization=org_id)
+          credential = exact("credentials", os.environ["CREDENTIAL_NAME"], organization=org_id)
+          if not project or not credential:
+              raise SystemExit("Required AAP project or machine credential was not found")
+
+          ee_name = os.environ["EXECUTION_ENVIRONMENT_NAME"]
+          execution_environment = exact("execution_environments", ee_name) if ee_name else None
+          template_name = os.environ["JOB_TEMPLATE_NAME"]
+          template = exact("job_templates", template_name, organization=org_id)
+          template_payload = {
+              "name": template_name,
+              "description": "Deploy immutable HeliosMigration artifact to MigrationLab IIS",
+              "job_type": "run",
+              "inventory": inventory["id"],
+              "project": project["id"],
+              "playbook": os.environ["PLAYBOOK"],
+              "ask_variables_on_launch": True,
+              "ask_limit_on_launch": True,
+              "limit": host_name,
+              "verbosity": 1,
+          }
+          if execution_environment:
+              template_payload["execution_environment"] = execution_environment["id"]
+          if template:
+              template = api("PATCH", f"/api/controller/v2/job_templates/{template['id']}/", template_payload)
+          else:
+              template = api("POST", "/api/controller/v2/job_templates/", template_payload)
+
+          api("POST", f"/api/controller/v2/job_templates/{template['id']}/credentials/", {"id": credential["id"]})
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(
+                  f"inventory_id={inventory['id']}\nhost_id={host['id']}\njob_template_id={template['id']}\n")
+          print(f"AAP job template ready; id={template['id']}")
+          PY

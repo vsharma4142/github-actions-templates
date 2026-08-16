@@ -1,0 +1,118 @@
+---
+name: Reusable AAP Job Launch
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: GitHub runner used to call AAP
+        required: false
+        type: string
+        default: ubuntu-latest
+      job-template-id:
+        description: AAP controller job template ID
+        required: true
+        type: string
+      environment-name:
+        description: Protected GitHub Environment governing this deployment
+        required: true
+        type: string
+      extra-vars-json:
+        description: JSON object passed to the Ansible playbook
+        required: true
+        type: string
+      verify-tls:
+        description: Verify the AAP gateway TLS certificate
+        required: false
+        type: boolean
+        default: true
+      timeout-seconds:
+        description: Maximum wait time for the AAP job
+        required: false
+        type: number
+        default: 1200
+    secrets:
+      aap-base-url:
+        description: AAP platform gateway URL
+        required: true
+      aap-token:
+        description: Rotated AAP API token
+        required: true
+      iis-host:
+        description: Inventory host used as the job limit
+        required: true
+    outputs:
+      job-id:
+        description: Launched AAP job ID
+        value: ${{ jobs.launch.outputs.job-id }}
+      job-url:
+        description: AAP job API URL
+        value: ${{ jobs.launch.outputs.job-url }}
+
+jobs:
+  launch:
+    name: Launch AAP job and wait
+    runs-on: ${{ inputs.runner }}
+    environment: ${{ inputs.environment-name }}
+    permissions:
+      contents: read
+    outputs:
+      job-id: ${{ steps.launch.outputs.job_id }}
+      job-url: ${{ steps.launch.outputs.job_url }}
+    steps:
+      - name: Launch job and monitor terminal status
+        id: launch
+        shell: bash
+        env:
+          AAP_BASE_URL: ${{ secrets.aap-base-url }}
+          AAP_TOKEN: ${{ secrets.aap-token }}
+          JOB_TEMPLATE_ID: ${{ inputs.job-template-id }}
+          LIMIT: ${{ secrets.iis-host }}
+          EXTRA_VARS_JSON: ${{ inputs.extra-vars-json }}
+          VERIFY_TLS: ${{ inputs.verify-tls }}
+          TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import json
+          import os
+          import ssl
+          import time
+          import urllib.request
+
+          base = os.environ["AAP_BASE_URL"].rstrip("/")
+          token = os.environ["AAP_TOKEN"]
+          context = ssl.create_default_context() if os.environ["VERIFY_TLS"].lower() == "true" else ssl._create_unverified_context()
+
+          def api(method, path, payload=None):
+              body = None if payload is None else json.dumps(payload).encode()
+              request = urllib.request.Request(
+                  f"{base}{path}", data=body, method=method,
+                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+              with urllib.request.urlopen(request, context=context, timeout=60) as response:
+                  content = response.read().decode()
+                  return json.loads(content) if content else {}
+
+          extra_vars = json.loads(os.environ["EXTRA_VARS_JSON"])
+          if not isinstance(extra_vars, dict):
+              raise SystemExit("extra-vars-json must contain one JSON object")
+          template_id = int(os.environ["JOB_TEMPLATE_ID"])
+          launch = api("POST", f"/api/controller/v2/job_templates/{template_id}/launch/", {
+              "limit": os.environ["LIMIT"], "extra_vars": extra_vars})
+          job_id = launch["job"]
+          deadline = time.monotonic() + int(os.environ["TIMEOUT_SECONDS"])
+          while time.monotonic() < deadline:
+              job = api("GET", f"/api/controller/v2/jobs/{job_id}/")
+              status = job.get("status", "unknown")
+              print(f"AAP job {job_id}: {status}")
+              if status == "successful":
+                  break
+              if status in {"failed", "error", "canceled"}:
+                  raise SystemExit(f"AAP job {job_id} ended with status '{status}'")
+              time.sleep(10)
+          else:
+              raise SystemExit(f"AAP job {job_id} timed out")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"job_id={job_id}\njob_url={base}/api/controller/v2/jobs/{job_id}/\n")
+          PY

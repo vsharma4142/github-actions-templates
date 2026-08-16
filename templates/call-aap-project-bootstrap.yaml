@@ -1,0 +1,47 @@
+---
+name: Bootstrap AAP Project
+
+on:
+  workflow_dispatch:
+    inputs:
+      organization-name:
+        description: Existing AAP organization
+        required: false
+        default: Default
+        type: string
+      project-name:
+        description: AAP project name
+        required: false
+        default: github-actions-templates
+        type: string
+      scm-branch:
+        description: Git branch synchronized by AAP
+        required: false
+        default: migration/enterprise-dotnet-iis-pilot
+        type: string
+      scm-credential-id:
+        description: Optional AAP Source Control credential ID for a private GitHub repo
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  create-project:
+    name: Create or update AAP project
+    uses: vsharma4142/github-actions-templates/.github/workflows/reusable-aap-project-bootstrap.yaml@migration/enterprise-dotnet-iis-pilot
+    with:
+      organization-name: ${{ inputs.organization-name }}
+      project-name: ${{ inputs.project-name }}
+      project-description: Central Ansible content used by Azure DevOps to GitHub Actions Migration Factory
+      scm-url: https://github.com/vsharma4142/github-actions-templates.git
+      scm-branch: ${{ inputs.scm-branch }}
+      scm-credential-id: ${{ inputs.scm-credential-id }}
+      scm-update-on-launch: true
+      allow-branch-override: false
+      verify-tls: true
+    secrets:
+      aap-base-url: ${{ secrets.AAP_BASE_URL }}
+      aap-token: ${{ secrets.AAP_TOKEN }}

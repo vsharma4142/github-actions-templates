@@ -1,0 +1,44 @@
+---
+name: Bootstrap MigrationLab in AAP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  project:
+    uses: vsharma4142/github-actions-templates/.github/workflows/reusable-aap-project-bootstrap.yaml@migration/enterprise-dotnet-iis-pilot
+    with:
+      project-name: github-actions-templates
+      scm-url: https://github.com/vsharma4142/github-actions-templates.git
+      scm-branch: migration/enterprise-dotnet-iis-pilot
+    secrets:
+      aap-base-url: ${{ secrets.AAP_BASE_URL }}
+      aap-token: ${{ secrets.AAP_TOKEN }}
+
+  credential:
+    uses: vsharma4142/github-actions-templates/.github/workflows/reusable-aap-machine-credential-bootstrap.yaml@migration/enterprise-dotnet-iis-pilot
+    with:
+      credential-name: MigrationLab WinRM
+    secrets:
+      aap-base-url: ${{ secrets.AAP_BASE_URL }}
+      aap-token: ${{ secrets.AAP_TOKEN }}
+      windows-username: ${{ secrets.MIGRATIONLAB_WINDOWS_USERNAME }}
+      windows-password: ${{ secrets.MIGRATIONLAB_WINDOWS_PASSWORD }}
+
+  controller:
+    needs: [project, credential]
+    uses: vsharma4142/github-actions-templates/.github/workflows/reusable-aap-controller-job-bootstrap.yaml@migration/enterprise-dotnet-iis-pilot
+    with:
+      project-name: github-actions-templates
+      credential-name: MigrationLab WinRM
+      job-template-name: Deploy HeliosMigration to MigrationLab IIS
+      playbook: ansible/iis/deploy-iis.yml
+      winrm-ca-cert-path: ${{ vars.WINRM_CA_CERT_PATH || '' }}
+    secrets:
+      aap-base-url: ${{ secrets.AAP_BASE_URL }}
+      aap-token: ${{ secrets.AAP_TOKEN }}
+      iis-host: ${{ secrets.IIS_HOST }}
+      winrm-port: ${{ secrets.WINRM_PORT }}
