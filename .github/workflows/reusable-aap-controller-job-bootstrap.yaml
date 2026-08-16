@@ -40,7 +40,12 @@ on:
         type: string
         default: ansible/iis/deploy-iis.yml
       execution-environment-name:
-        description: Optional execution environment containing ansible.windows
+        description: Optional execution environment containing ansible.windows and pypsrp
+        required: false
+        type: string
+        default: ''
+      winrm-ca-cert-path:
+        description: Optional CA PEM path inside the AAP execution environment
         required: false
         type: string
         default: ''
@@ -60,7 +65,7 @@ on:
         description: Windows inventory host name or routable address
         required: true
       winrm-port:
-        description: WinRM port
+        description: WinRM HTTPS port; must be 5986 for this secure lab profile
         required: true
     outputs:
       inventory-id:
@@ -94,6 +99,7 @@ jobs:
           INVENTORY_NAME: ${{ inputs.inventory-name }}
           HOST_NAME: ${{ secrets.iis-host }}
           WINRM_PORT: ${{ secrets.winrm-port }}
+          WINRM_CA_CERT_PATH: ${{ inputs.winrm-ca-cert-path }}
           PROJECT_NAME: ${{ inputs.project-name }}
           CREDENTIAL_NAME: ${{ inputs.credential-name }}
           JOB_TEMPLATE_NAME: ${{ inputs.job-template-name }}
@@ -147,16 +153,23 @@ jobs:
               inventory = api("POST", "/api/controller/v2/inventories/", inventory_payload)
 
           host_name = os.environ["HOST_NAME"]
+          winrm_port = int(os.environ["WINRM_PORT"])
+          if winrm_port != 5986:
+              raise SystemExit("Secure MigrationLab profile requires WinRM over HTTPS on port 5986")
           host = exact("hosts", host_name, inventory=inventory["id"])
           host_vars = {
               "ansible_host": host_name,
-              "ansible_port": int(os.environ["WINRM_PORT"]),
-              "ansible_connection": "winrm",
-              "ansible_winrm_scheme": "http",
-              "ansible_winrm_transport": "ntlm",
-              "ansible_winrm_server_cert_validation": "ignore",
+              "ansible_port": winrm_port,
+              "ansible_connection": "psrp",
+              "ansible_psrp_protocol": "https",
+              "ansible_psrp_auth": "negotiate",
+              "ansible_psrp_cert_validation": "validate",
+              "ansible_psrp_negotiate_send_cbt": True,
               "ansible_shell_type": "powershell",
           }
+          ca_cert_path = os.environ["WINRM_CA_CERT_PATH"].strip()
+          if ca_cert_path:
+              host_vars["ansible_psrp_ca_cert"] = ca_cert_path
           host_payload = {
               "name": host_name,
               "inventory": inventory["id"],

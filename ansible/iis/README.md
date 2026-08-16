@@ -50,7 +50,13 @@ Point an AWX Project at this repository and branch. AWX will discover `collectio
 
 For the laptop MigrationLab, configure the job template to target the Windows host over WinRM/PSRP using an AWX machine credential. The sample generated-workflow call pattern is `templates/call-iis-awx-deploy.yaml`.
 
-The checked-in lab inventory example is `ansible/inventory/host.ini`; its host and port tokens must be rendered from secrets outside source control. The API bootstrap workflows pull `AAP_BASE_URL`, `IIS_HOST`, `WINRM_PORT`, and `AAP_TOKEN` through the caller's GitHub secrets, then create the equivalent AAP inventory, `iis_targets` group, host, machine credential association, and controller job template. Inventory configuration does not create network reachability; SaaS AAP still requires a supported routed execution path to the private Windows host.
+The checked-in lab inventory example is `ansible/inventory/host.ini`. It uses PSRP over HTTPS on port 5986, Negotiate authentication, channel binding, and mandatory server-certificate validation. The API bootstrap workflows pull `AAP_BASE_URL`, `IIS_HOST`, `WINRM_PORT`, and `AAP_TOKEN` through the caller's GitHub secrets, then create the equivalent AAP inventory, `iis_targets` group, host, machine credential association, and controller job template. `WINRM_PORT` must be `5986`.
+
+The certificate DNS name or SAN must match `IIS_HOST`. For a private CA, build or mount its PEM CA chain in the execution environment and set `WINRM_CA_CERT_PATH` to that in-container path. The execution environment also needs `pypsrp`. Do not set certificate validation to `ignore`.
+
+TLS secures WinRM traffic but does not provide routing. Inventory configuration still does not create network reachability; SaaS AAP requires a supported private execution path to the Windows host. Do not publish port 5986 through a home router or expose it to the internet.
+
+Run `ansible/windows/configure-winrm-https.ps1` as an administrator on the Windows target to create the HTTPS listener, remove HTTP/5985, disable Basic/unencrypted WinRM, and restrict the firewall rule to the private execution-node CIDR.
 
 ## AAP bootstrap templates
 

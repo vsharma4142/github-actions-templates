@@ -36,6 +36,7 @@ jobs:
       credential-name: MigrationLab WinRM
       job-template-name: Deploy HeliosMigration to MigrationLab IIS
       playbook: ansible/iis/deploy-iis.yml
+      winrm-ca-cert-path: ${{ vars.WINRM_CA_CERT_PATH || '' }}
     secrets:
       aap-base-url: ${{ secrets.AAP_BASE_URL }}
       aap-token: ${{ secrets.AAP_TOKEN }}
